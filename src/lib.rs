@@ -50,6 +50,9 @@ pub enum LoadError {
     NoSuchReference(ObjectId),
     /// An element that was expected to be a reference was not a reference
     NotAReference,
+     // Add: Error for incorrect structures
+    #[error(msg_embedded, non_std, no_from)]
+    StructureError(String)
 }
 
 /// Errors That may occur while setting values in a form
@@ -137,6 +140,98 @@ impl Form {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, LoadError> {
         let doc = Document::load(path)?;
         Self::load_doc(doc)
+    }
+
+     pub fn load2<P: AsRef<Path>>(path: P) -> Result<Form, LoadError> {
+        let doc = Document::load(path)?;
+        Self::load_doc2(doc)
+    }
+    // New method for reading documents; it handles inline dictionaries and some unexpected errors.
+    // Also aimed to make error messages more descriptive.
+    // To use this function, use _load2_ instead of _load_, which uses _load_doc_ from the original _forms_pdf_ crate.
+    fn load_doc2(document: Document) -> Result<Self, LoadError> {    
+        let mut form_ids = Vec::new();
+        let mut queue = VecDeque::new(); 
+
+        {// Block so borrow of doc ends before doc is moved into the result
+
+        // 0. Get root dict
+        let root_dict = &document
+                            .trailer
+                            .get(b"Root")?  
+                            .deref(&document)?
+                            .as_dict()?;
+
+        // 1. Get an AcroForm object (it could be of different types, see 2.)
+        let acroform_obj  = match root_dict.get(b"AcroForm") {
+                                Ok(o) => o,
+                                Err(_) => return Err(LoadError::StructureError("Key \"AcroForm\" doesn't exist in document".into()))
+                            };
+
+        // 2. Get the fields object contained in AcroForm, which can be a reference or an inline dictionary
+        let fields_obj = match acroform_obj {
+            Object::Reference(obj_id) => {
+                let acroform = match document.objects.get(obj_id) {
+                    Some(Object::Dictionary(dict)) => dict,
+                    Some(_) => return Err(LoadError::StructureError("AcroForm cannot be parsed to a dictionary".into())),
+                    None => return Err(LoadError::StructureError("Invalid reference to AcroForm".into())),
+                };
+                match acroform.get(b"Fields") {
+                    Ok(obj) => obj,
+                    Err(_) => return Err(LoadError::StructureError("Key \"Fields\" doesn't exist in AcroForm".into())),
+                }
+            }
+            Object::Dictionary(dict) => {
+                match dict.get(b"Fields") {
+                    Ok(obj) => obj,
+                    Err(_) => return Err(LoadError::StructureError("Key \"Fields\" doesn't exist in AcroForm".into())),
+                }
+            }
+            _ => return Err(LoadError::StructureError("AcroForm is not a reference neither a dictionary".into())),
+        };
+
+        // 3. Get the fields in an array and transform it into a double-ended queue.
+        // Again, the fields object obtained in 2. can be either a reference or a dictionary.
+        let fields_array = {
+            match fields_obj {
+            Object::Array(arr) => arr,
+            Object::Reference(obj_id) => {
+                let deref_obj = document.get_object(*obj_id)?;
+                deref_obj.as_array()?
+            },
+            _ => return Err(LoadError::NotAReference),
+        }};
+
+        queue.extend(fields_array.iter().cloned());
+
+        // 4. Iterate the field queue, from parents to children
+        while let Some(objref) = queue.pop_front() {
+            let obj = match objref.deref(&document) {
+                Ok(o) => o,
+                Err(_) => continue, // Skip if the field cannot be dereferenced, maybe other fields can be read
+            };
+
+            if let Object::Dictionary(ref dict) = *obj {
+                // If the field has a "FT" key, then it receives input and it is added to the list of field IDs (form_ids)
+                if dict.get(b"FT").is_ok() {
+                    if let Ok(reference) = objref.as_reference() {
+                        form_ids.push(reference);
+                    }
+                }
+
+                // Another option is that the field has children. If that's the case, add them to the queue
+                if let Ok(&Object::Array(ref kids)) = dict.get(b"Kids") {
+                    queue.extend(kids.iter().cloned());
+                }
+            }
+        }
+        }
+        
+        // 5. Return the original document and the vector with the IDs that store a form field
+        Ok(Form {
+            document,
+            form_ids,
+        })
     }
 
     fn load_doc(mut document: Document) -> Result<Self, LoadError> {
