@@ -14,7 +14,7 @@ use std::str;
 use bitflags::_core::str::from_utf8;
 
 use lopdf::content::{Content, Operation};
-use lopdf::{Document, Object, ObjectId, StringFormat, Dictionary};
+use lopdf::{Dictionary, Document, Object, ObjectId, StringFormat};
 
 use crate::utils::*;
 
@@ -25,7 +25,7 @@ use crate::utils::*;
 /// index.
 pub struct Form {
     pub document: Document,
-    form_ids: Vec<ObjectId>,
+    pub form_ids: Vec<ObjectId>,
 }
 
 /// The possible types of fillable form fields in a PDF
@@ -50,7 +50,7 @@ pub enum LoadError {
     NoSuchReference(ObjectId),
     /// An element that was expected to be a reference was not a reference
     NotAReference,
-     // Add: Error for incorrect structures
+    // Add: Error for incorrect structures
     #[error(msg_embedded, non_std, no_from)]
     StructureError(String)
 }
@@ -142,7 +142,7 @@ impl Form {
         Self::load_doc(doc)
     }
 
-     pub fn load2<P: AsRef<Path>>(path: P) -> Result<Form, LoadError> {
+    pub fn load2<P: AsRef<Path>>(path: P) -> Result<Form, LoadError> {
         let doc = Document::load(path)?;
         Self::load_doc2(doc)
     }
@@ -549,6 +549,66 @@ impl Form {
         }
     }
 
+    // New function to write text that uses the extended function _regenerate_text_appearance2_
+    pub fn set_text_fs(&mut self, n: usize, s: String, f:i32) -> Result<(), ValueError> {
+        if let FieldState::Text { .. } = self.get_state(n) {
+            let field = self
+                .document
+                .objects
+                .get_mut(&self.form_ids[n])
+                .unwrap()
+                .as_dict_mut()
+                .unwrap();
+
+            field.set("V", Object::string_literal(s.into_bytes()));
+
+            // Regenerate the text appearance using the new function. Issues a warning in case
+            // it was not regenerated correctly
+            if let Err(e) = self.regenerate_text_appearance2(n, f) {
+                println!("Text apperance regeneration failed: {e}"); 
+            }
+
+            Ok(())
+        } else { Err(ValueError::TypeMismatch) }
+    }
+
+    // New function to write text that uses the extended function _regenerate_text_appearance2_
+    // Additionally, this function marks the filled PDF fields as read-only
+    pub fn set_text_fs_ro(&mut self, n: usize, s: String, f:i32) -> Result<(), ValueError> {
+        if let FieldState::Text { .. } = self.get_state(n) {
+            let field = self
+                .document
+                .objects
+                .get_mut(&self.form_ids[n])
+                .unwrap()
+                .as_dict_mut()
+                .unwrap();
+
+            field.set("V", Object::string_literal(s.into_bytes()));
+
+            //This block sets the read-only flag (bit 0 of Ff)            
+            let mut v = 0;
+            match field.get(b"Ff") {
+                Ok(f) => {
+                    if let Object::Integer(val) = f {
+                    v = *val;
+                    }
+                }
+                Err(_) => { v = 0; }
+            }
+            let new_flags = v | 1 << 0;
+            field.set(b"Ff", new_flags);
+
+            // Regenerate the text appearance using the new function. Issues a warning in case
+            // it was not regenerated correctly
+            if let Err(e) = self.regenerate_text_appearance2(n, f) {
+                println!("Text apperance regeneration failed: {e}"); 
+            }
+
+            Ok(())
+        } else { Err(ValueError::TypeMismatch) }
+    }
+
     /// Regenerates the appearance for the field at index `n` due to an alteration of the
     /// original TextField value, the AP will be updated accordingly.
     ///
@@ -681,7 +741,7 @@ impl Form {
 
         Ok(())
     }
-
+    
     // Extended function to regenerate the appearance. Additionally, it takes an i32 argument
     // that serves as the font size for the text of unselected fields (represented
     // in the stream contained in the object with key AP-N). Ensuring this integer is not zero
