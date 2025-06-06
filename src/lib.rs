@@ -14,7 +14,7 @@ use std::str;
 use bitflags::_core::str::from_utf8;
 
 use lopdf::content::{Content, Operation};
-use lopdf::{Document, Object, ObjectId, StringFormat};
+use lopdf::{Document, Object, ObjectId, StringFormat, Dictionary};
 
 use crate::utils::*;
 
@@ -679,6 +679,185 @@ impl Form {
             let _ = stream.compress();
         }
 
+        Ok(())
+    }
+
+    // Extended function to regenerate the appearance. Additionally, it takes an i32 argument
+    // that serves as the font size for the text of unselected fields (represented
+    // in the stream contained in the object with key AP-N). Ensuring this integer is not zero
+    // makes the new values of the fields visible when opening the PDF.
+    fn regenerate_text_appearance2(&mut self, n: usize, f: i32) -> Result<(), lopdf::Error> {
+        let field = {
+            self.document
+                .objects
+                .get(&self.form_ids[n])
+                .unwrap()
+                .as_dict()
+                .unwrap().clone()
+        };
+
+        // The value of the object (should be a string)
+        let value = field.get(b"V")?.to_owned();
+
+        // The default appearance of the object (should be a string)
+        let da_default = concat!("/Helv {f} Tf 0 g").as_bytes().to_vec();
+        let da = match field.get(b"DA") {
+            Ok(Object::String(bytes, _)) => {
+                let s = std::str::from_utf8(bytes).unwrap_or("");
+
+                if s.contains("0 Tf") || s.trim().is_empty() {
+                    Object::string_literal(da_default)
+                } else {
+                    Object::String(bytes.clone(), StringFormat::Literal)
+                }
+            }
+            _ => Object::string_literal(da_default)
+        };
+
+        // The default appearance of the object (should be a string)
+        let rect = field
+            .get(b"Rect")?
+            .as_array()?
+            .iter()
+            .map(|object| {
+                object
+                    .as_f64()
+                    .unwrap_or(object.as_i64().unwrap_or(0) as f64) as f32
+            })
+            .collect::<Vec<_>>();
+
+        // Gets the object stream
+        // Fix: This block was made more robust to allow the AP key
+        // to be absent and assign a new one with a default value
+        let object_id = match field.get(b"AP") {
+            Ok(Object::Dictionary(ap_dict)) => {
+                Some(ap_dict.get(b"N").and_then(|n| n.as_reference())?)
+            }
+            _ => None,
+        };
+
+        let object_id = match object_id {
+            Some(id) => id,
+            None => {
+                // New empty stream for AP
+                use lopdf::{Stream};
+
+                let stream = Stream::new(Dictionary::new(), Vec::new());
+                let new_id = self.document.new_object_id();
+                self.document.objects.insert(new_id, Object::Stream(stream));
+
+                let field_mut = self.document
+                .objects
+                .get_mut(&self.form_ids[n])
+                .unwrap()
+                .as_dict_mut()
+                .unwrap();
+
+                // AP dict with N key to new stream
+                let mut ap_dict = Dictionary::new();
+                ap_dict.set("N", Object::Reference(new_id));
+                field_mut.set("AP", Object::Dictionary(ap_dict));
+
+                new_id
+            }
+        };
+
+        let stream = self.document.get_object_mut(object_id)?.as_stream_mut()?;
+
+        // Decode and get the content, even if is compressed
+        let mut content = {
+            if let Ok(content) = stream.decompressed_content() {
+                Content::decode(&content)?
+            } else {
+                Content::decode(&stream.content)?
+            }
+        };
+
+        // Ignored operators
+        let ignored_operators = vec![
+            "bt", "tc", "tw", "tz", "g", "tm", "tr", "tf", "tj", "et", "q", "bmc", "emc",
+        ];
+
+        // Remove these ignored operators as we have to generate the text and fonts again
+        content.operations.retain(|operation| {
+            !ignored_operators.contains(&operation.operator.to_lowercase().as_str())
+        });
+
+        // Let's construct the text widget
+        content.operations.append(&mut vec![
+            Operation::new("BMC", vec!["Tx".into()]),
+            Operation::new("q", vec![]),
+            Operation::new("BT", vec![]),
+        ]);
+
+        // This block and the next were modified to parse the DA
+        // (either the one found in the document or the default assigned).
+        // If the font size is 0, it is replaced by the function argument _f_
+        let font = parse_font(match da {
+            Object::String(ref bytes, _) => Some(from_utf8(bytes)?),  //Parsear esto mejor para encontrar una manera de capturar el tamaño de fuente
+            _ => Some("((\"0\", 0), (\"g\", 0, 0, 0))")
+        });
+
+        // Define some helping font variables
+        let font_name = (font.0).0;
+        let font_size_da = (font.0).1;
+        let font_size = if let 0 = font_size_da { f } else { font_size_da };
+        let font_color = font.1;
+
+        // Set the font type and size and color
+        content.operations.append(&mut vec![
+            Operation::new("Tf", vec![font_name.into(), font_size.into()]),
+            Operation::new(
+                font_color.0,
+                match font_color.0 {
+                    "k" => vec![
+                        font_color.1.into(),
+                        font_color.2.into(),
+                        font_color.3.into(),
+                        font_color.4.into(),
+                    ],
+                    "rg" => vec![
+                        font_color.1.into(),
+                        font_color.2.into(),
+                        font_color.3.into(),
+                    ],
+                    _ => vec![font_color.1.into()],
+                },
+            ),
+        ]);
+
+        // Calculate the text offset
+        let x = 2.0; // Suppose this fixed offset as we should have known the border here
+
+        // Formula picked up from Poppler
+        let dy = rect[1] - rect[3];
+        let y = if dy > 0.0 {
+            0.5 * dy - 0.4 * font_size as f32
+        } else {
+            0.5 * font_size as f32
+        };
+
+        // Set the text bounds, first are fixed at "1 0 0 1" and then the calculated x,y
+        content.operations.append(&mut vec![Operation::new(
+            "Tm",
+            vec![1.into(), 0.into(), 0.into(), 1.into(), x.into(), y.into()],
+        )]);
+
+        // Set the text value and some finalizing operations
+        content.operations.append(&mut vec![
+            Operation::new("Tj", vec![value]),
+            Operation::new("ET", vec![]),
+            Operation::new("Q", vec![]),
+            Operation::new("EMC", vec![]),
+        ]);
+
+        // Set the new content to the original stream and compress it
+        if let Ok(encoded_content) = content.encode() {
+            stream.set_plain_content(encoded_content);
+            let _ = stream.compress();
+        }
+
+        //self.document.objects.insert(self.form_ids[n], Object::Dictionary(field));
         Ok(())
     }
 
