@@ -4,7 +4,7 @@ A library to programatically identify and fill out PDF forms.
 **WARNING**: This is a fork of "pdf_forms" by [malte-v](https://github.com/malte-v), including changes made by [aosirisj](https://github.com/aosirisj). The original "pdf_form" crate was made by [jsandler18](https://github.com/jsandler18).
 
 ## Example Code
-Read a PDF and discover the form fields. Add `pdf_forms2 = "0.1.0"` to your cargo.toml file.
+Read a PDF and discover the form fields. Add `pdf_forms2 = { path = "path/to/pdf_forms2" }` to your cargo.toml file.
 ```rust
 use pdf_forms2::{Form, FieldType};
 
